@@ -7,6 +7,12 @@ are just the wordlist enumerating itself. The canary probe detects this and
 collapses the false positives to a single, honest finding.
 """
 import argparse
+import contextlib
+import io
+import itertools
+import re
+import time
+import types
 import unittest
 
 import ntlmscout as ns
@@ -240,6 +246,139 @@ class CanaryCountTests(unittest.TestCase):
         jobs = ns.plan_targets(self._args(["https://h.example/"]))
         canaries = [j[3] for j in jobs if ns.CANARY_MARKER in (j[3] or "")]
         self.assertEqual(len(set(canaries)), len(canaries))
+class HostCountTests(unittest.TestCase):
+    """_host_count() must match real enumeration without enumerating."""
+
+    def _enumerated(self, token):
+        return len(list(ns._expand_targets([token])))
+
+    def test_matches_enumeration_for_small_prefixes(self):
+        for token in ["10.0.0.0/24", "10.0.0.0/30", "10.0.0.0/31", "10.0.0.7/32",
+                      "2001:db8::/120", "2001:db8::/126", "2001:db8::1/128"]:
+            self.assertEqual(ns._host_count(token), self._enumerated(token), token)
+
+    def test_counts_large_prefixes_without_enumerating(self):
+        self.assertEqual(ns._host_count("10.0.0.0/16"), 65534)
+        self.assertEqual(ns._host_count("10.0.0.0/8"), 16777214)
+
+    def test_non_cidr_tokens_count_as_one_host(self):
+        for token in ["10.0.0.1", "host.example", "https://h.example/ews/",
+                      "[2001:db8::1]:445", "10.0.0.1:445"]:
+            self.assertEqual(ns._host_count(token), 1, token)
+
+
+class ExpandTargetsTests(unittest.TestCase):
+    """Expansion is lazy, so a large prefix is never built as a list."""
+
+    def test_returns_a_generator(self):
+        self.assertIsInstance(ns._expand_targets(["10.0.0.0/8"]), types.GeneratorType)
+
+    def test_large_prefix_yields_immediately(self):
+        started = time.time()
+        first = list(itertools.islice(ns._expand_targets(["10.0.0.0/8"]), 3))
+        self.assertEqual(first, ["10.0.0.1", "10.0.0.2", "10.0.0.3"])
+        # Materializing a /8 would take minutes and gigabytes.
+        self.assertLess(time.time() - started, 2.0)
+
+    def test_passes_through_non_cidr_tokens(self):
+        tokens = ["host.example", "https://h.example/ews/", "[2001:db8::1]"]
+        self.assertEqual(list(ns._expand_targets(tokens)), tokens)
+
+    def test_expands_nets_whose_hosts_list_is_empty(self):
+        self.assertEqual(list(ns._expand_targets(["10.0.0.0/31"])),
+                         ["10.0.0.0", "10.0.0.1"])
+
+
+def _canary_free(jobs):
+    """Jobs with the random canary nonce normalized, so plans compare equal."""
+    out = []
+    for (proto, host, port, url) in jobs:
+        if url and ns.CANARY_MARKER in url:
+            url = re.sub(r"/_ntlmscout_canary_[0-9a-f]+/", "/_CANARY_/", url)
+        out.append((proto, host, port, url))
+    return sorted(out)
+
+
+class StreamingPlanTests(unittest.TestCase):
+    def _args(self, targets, **kw):
+        kw.setdefault("no_discover", False)
+        kw.setdefault("no_internal_ip", False)
+        kw.setdefault("max_jobs", 0)
+        return argparse.Namespace(targets=targets, input_list=None, **kw)
+
+    def test_batches_cover_exactly_the_same_plan(self):
+        targets = ["10.0.0.0/29", "https://h.example/", "10.0.0.50:445"]
+        whole = ns.plan_targets(self._args(targets))
+        streamed = [j for b in ns.iter_job_batches(self._args(targets), size=100)
+                    for j in b]
+        self.assertEqual(_canary_free(whole), _canary_free(streamed))
+
+    def test_a_host_is_never_split_across_batches(self):
+        batches = list(ns.iter_job_batches(self._args(["10.0.0.0/26"]), size=500))
+        self.assertGreater(len(batches), 1, "test needs more than one batch")
+        seen = set()
+        for batch in batches:
+            hosts = {j[1] for j in batch}
+            self.assertFalse(hosts & seen, "a host spanned two batches")
+            seen |= hosts
+
+    def test_batches_respect_the_size_threshold(self):
+        size = 500
+        batches = list(ns.iter_job_batches(self._args(["10.0.0.0/27"]), size=size))
+        # A batch is closed once it reaches `size`, so it may overshoot by at
+        # most the last host's job group, but never by more.
+        group = len(ns._plan_token("10.0.0.1", self._args([])))
+        for b in batches:
+            self.assertLessEqual(len(b), size + group)
+
+    def test_repeated_target_tokens_are_planned_once(self):
+        once = ns.plan_targets(self._args(["10.0.0.1"]))
+        twice = ns.plan_targets(self._args(["10.0.0.1", "10.0.0.1"]))
+        self.assertEqual(len(once), len(twice))
+
+
+class PlanBudgetTests(unittest.TestCase):
+    def _args(self, targets, **kw):
+        kw.setdefault("no_discover", False)
+        kw.setdefault("no_internal_ip", False)
+        kw.setdefault("max_jobs", ns._MAX_JOBS)
+        return argparse.Namespace(targets=targets, input_list=None, **kw)
+
+    def test_projection_matches_the_real_plan(self):
+        for targets in (["10.0.0.0/29"], ["https://h.example/"],
+                        ["https://h.example/ews/"], ["10.0.0.1:445"],
+                        ["10.0.0.0/30", "smb://h.example"]):
+            args = self._args(targets, max_jobs=0)
+            _hosts, projected = ns.project_plan(args)
+            self.assertEqual(projected, len(ns.plan_targets(args)), targets)
+
+    def test_counts_hosts_without_enumerating(self):
+        hosts, _probes = ns.project_plan(self._args(["10.0.0.0/16"], max_jobs=0))
+        self.assertEqual(hosts, 65534)
+
+    def test_refuses_a_plan_over_budget(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            hosts, probes = ns.project_plan(self._args(["10.0.0.0/16"]))
+        self.assertIsNone(hosts)
+        self.assertIsNone(probes)
+        self.assertIn("refusing to plan", err.getvalue())
+        self.assertIn("--no-discover", err.getvalue())
+
+    def test_zero_budget_means_unlimited(self):
+        hosts, probes = ns.project_plan(self._args(["10.0.0.0/16"], max_jobs=0))
+        self.assertEqual(hosts, 65534)
+        self.assertGreater(probes, 24000000)
+
+    def test_spray_counts_one_probe_per_target(self):
+        hosts, probes = ns.project_plan(self._args(["10.0.0.0/24"], max_jobs=0),
+                                        per_target=1)
+        self.assertEqual((hosts, probes), (254, 254))
+
+    def test_fanout_is_measured_not_hardcoded(self):
+        args = self._args([], max_jobs=0)
+        self.assertEqual(ns._fanout("0.0.0.0", args),
+                         len(ns._plan_token("0.0.0.0", args)))
 
 
 if __name__ == "__main__":

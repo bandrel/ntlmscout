@@ -66,6 +66,32 @@ python3 ntlmscout.py --spray -I hosts.txt -u users.txt -p 'Winter2026!' --delay 
 
 Recon is a **full sweep by default**. Trim it with `--no-discover` (skip the HTTP path wordlist) or `--no-internal-ip` (skip the cert/OXID/IIS checks). See `--help` for the full menu.
 
+### Scan cost
+
+A full sweep is not cheap per host, so the size of a range matters more than it
+looks. One bare host fans out to **376 probes** by default: 23 NTLM-capable
+ports, 6 of them web ports multiplied by the 83-entry HTTP path wordlist, plus
+the internal-disclosure checks and the catch-all canaries per web endpoint. The
+scope flags change that sharply.
+
+| Flags | Probes per host | A /24 | A /16 |
+|---|---|---|---|
+| default | 376 | 95,504 | 24,640,784 |
+| `--no-discover` | 40 | 10,160 | 2,621,360 |
+| `--no-discover --no-internal-ip` | 23 | 5,842 | 1,507,282 |
+
+Closed ports are pruned with one fast connect per `host:port` before any probe
+runs, so the live probe count on a real network is usually far lower. The
+planner streams in batches and never holds the whole plan in memory, so peak
+memory tracks `--threads`, not the size of the range.
+
+A **probe budget** guards against a run that would take days by accident:
+ntlmscout refuses to start if the plan exceeds `--max-jobs` probes (500,000 by
+default) and tells you which flag to reach for. Raise it deliberately with
+`--max-jobs N`, or `--max-jobs 0` for no limit. Note that results for every
+probe are held in memory until the scan ends, so a very large `--max-jobs` still
+costs memory over a long run; prefer splitting the range.
+
 ## Example output
 
 ```
