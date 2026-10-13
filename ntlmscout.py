@@ -1171,6 +1171,29 @@ HTTP_PATHS = _normalize_paths(_HTTP_PATHS_RAW)
 
 
 # ---------------------------------------------------------------------------
+#  Catch-all (path-agnostic) NTLM detection
+#
+#  A site that enforces NTLM on *every* path -- an IIS site-wide Windows Auth
+#  filter, or an ADC / reverse proxy in front of the app -- answers the whole
+#  endpoint wordlist with a challenge, so the "discovered" endpoints are just
+#  the wordlist enumerating itself. We probe one random, cannot-exist path (a
+#  canary); if it also challenges, the host is a site-wide auth gate and its
+#  per-path hits are collapsed to a single, honest finding.
+# ---------------------------------------------------------------------------
+CANARY_MARKER = "/_ntlmscout_canary_"
+
+
+def canary_path():
+    """A random path that cannot correspond to a real application endpoint."""
+    return "{}{}/".format(CANARY_MARKER, uuid.uuid4().hex)
+
+
+def is_canary_result(result):
+    """True if this result came from the synthetic canary probe."""
+    return CANARY_MARKER in (result.get("url") or "")
+
+
+# ---------------------------------------------------------------------------
 #  Internal-address disclosure modules (passive; no auth / no relay)
 #
 #  The NTLM CHALLENGE never carries an IP, but two well-known unauthenticated
@@ -1830,6 +1853,25 @@ def plan_targets(args):
             for p, proto in sorted(PORT_PROTOCOL.items()):
                 _add_host(jobs, proto, host, p, args)
 
+    # One canary per discovered HTTP(S) endpoint: a random path that cannot
+    # exist. If it returns an NTLM challenge, the host challenges every path
+    # (see collapse_catchall_endpoints). WinRM is a single-path service, so the
+    # wordlist -- and the canary -- don't apply.
+    if discover:
+        canary_seen = set()
+        for (proto, host, port, url) in list(jobs):
+            if proto not in ("http", "https") or not url:
+                continue
+            if _job_port(proto, port) in _WINRM_PORTS:
+                continue
+            key = (proto, host, _job_port(proto, port))
+            if key in canary_seen:
+                continue
+            canary_seen.add(key)
+            scheme, rest = url.split("://", 1)
+            origin = "{}://{}".format(scheme, rest.split("/", 1)[0])
+            jobs.append((proto, host, port, origin + canary_path()))
+
     # Internal-disclosure jobs (on by default):
     #   * iisip   : one per unique http(s) endpoint (Host-header + PROPFIND)
     #   * tlscert : one per unique TLS endpoint (cert CN/SAN names + IPs)
@@ -2000,6 +2042,60 @@ def _fp_score(r):
     return len([v for v in r.get("fingerprint", {}).values() if v not in (None, "")])
 
 
+def _endpoint_key(r):
+    """(protocol, host, port) identity for an endpoint, with defaults resolved."""
+    return (r.get("protocol"), r.get("host"), _job_port(r.get("protocol"), r.get("port")))
+
+
+def _url_path(url):
+    """Path portion of a URL ('/' when there is none)."""
+    rest = url.split("://", 1)[-1]
+    return rest[rest.find("/"):] if "/" in rest else "/"
+
+
+def _catchall_representative(rs):
+    """The single endpoint to keep for a catch-all host: the site root when
+    present, otherwise the richest fingerprint, otherwise the first."""
+    for r in rs:
+        if _url_path(r.get("url") or "") == "/":
+            return r
+    return max(rs, key=_fp_score)
+
+
+def collapse_catchall_endpoints(results):
+    """Collapse site-wide (path-agnostic) NTLM auth to one endpoint per host.
+
+    A canary probe that returns an NTLM challenge proves the host challenges
+    every path, so its wordlist hits are false positives. The canary result is
+    dropped; for each affected (protocol, host, port) group one representative
+    keeps its challenge (tagged ``catchall``) while the rest stay in the list
+    for their disclosed names / addresses but no longer count as endpoints.
+
+    Mutates ``results`` in place and returns the filtered list.
+    """
+    catchall_keys = {_endpoint_key(r) for r in results
+                     if r.get("ntlm") and is_canary_result(r)}
+    out = []
+    groups = OrderedDict()
+    for r in results:
+        if is_canary_result(r):
+            continue  # synthetic path -- never reported as an endpoint
+        out.append(r)
+        if r.get("ntlm") and r.get("protocol") in ("http", "https"):
+            groups.setdefault(_endpoint_key(r), []).append(r)
+    for key, rs in groups.items():
+        if key not in catchall_keys:
+            continue
+        rep = _catchall_representative(rs)
+        for r in rs:
+            r["catchall"] = True
+            if r is rep:
+                r["catchall_collapsed"] = len(rs)
+            else:
+                r["ntlm"] = None
+    return out
+
+
 def print_host_summaries(results, roles=None, out=sys.stdout, full=False):
     """Per-host summary block.
 
@@ -2096,6 +2192,12 @@ def print_host_summaries(results, roles=None, out=sys.stdout, full=False):
             out.write(_color(row, C_RED, use_color) + "\n")
             for e in eps:
                 out.write("      - {}\n".format(e))
+            if any(r.get("catchall") for r in rs):
+                n = max((r.get("catchall_collapsed") or 0)
+                        for r in rs if r.get("catchall"))
+                out.write(_color(
+                    "      (site-wide NTLM auth -- path-agnostic; {} wordlist "
+                    "path(s) collapsed)".format(n), C_YELLOW, use_color) + "\n")
     out.write("=" * 72 + "\n")
 
 
@@ -2660,8 +2762,9 @@ def run_recon(args):
             done += 1
             if args.quiet:
                 continue
-            if args.verbose:
-                # Full live detail: every endpoint / probe.
+            if args.verbose and not is_canary_result(r):
+                # Full live detail: every endpoint / probe (the synthetic
+                # canary path is internal plumbing, not a finding).
                 if r.get("success"):
                     print(fmt_text(r)); print()
                 else:
@@ -2679,6 +2782,9 @@ def run_recon(args):
                 sys.stderr.flush()
         _clear_progress()
 
+    # Fold site-wide NTLM auth (path-agnostic) down to one finding per host so
+    # the wordlist doesn't masquerade as dozens of distinct endpoints.
+    results = collapse_catchall_endpoints(results)
     roles = resolve_host_roles(results)
     # "Exposed NTLM" = endpoints that actually returned an NTLM challenge (not
     # cert names / internal IPs / headers leaked via an adjacent check).
